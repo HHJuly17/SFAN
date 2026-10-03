@@ -1,0 +1,655 @@
+# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from basicsr.utils.registry import ARCH_REGISTRY
+
+# =========================
+# 1. LKAT
+# =========================
+class LKAT(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv0 = nn.Conv2d(dim, dim, 7, padding=7 // 2, groups=dim)
+        self.conv_spatial = nn.Conv2d(
+            dim, dim, 9, stride=1, padding=(9 // 2) * 4, groups=dim, dilation=4
+        )
+        self.conv1 = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        u = x
+        attn = self.conv0(x)
+        attn = self.conv_spatial(attn)
+        attn = self.conv1(attn)
+        return u * attn
+
+# =========================
+# 2. FGAR
+# =========================
+class FGAR(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+
+        # -----------------------------------------
+        # Structural attention branch
+        # -----------------------------------------
+        self.conv0 = nn.Conv2d(
+            dim, dim,
+            kernel_size=7,
+            padding=7 // 2,
+            groups=dim
+        )
+
+        self.conv_spatial = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=9,
+            stride=1,
+            padding=(9 // 2) * 4,
+            groups=dim,
+            dilation=4
+        )
+
+        self.conv1 = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=1
+        )
+
+        hidden_dim = max(dim // 4, 8)
+
+        # -----------------------------------------
+        # Frequency gate
+        # -----------------------------------------
+        self.freq_gate = nn.Sequential(
+            nn.Conv2d(
+                dim,
+                hidden_dim,
+                kernel_size=1
+            ),
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=hidden_dim
+            ),
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden_dim,
+                dim,
+                kernel_size=1
+            ),
+            nn.Sigmoid()
+        )
+
+        # -----------------------------------------
+        # High-frequency feature projection
+        # -----------------------------------------
+        self.freq_proj = nn.Sequential(
+            nn.Conv2d(
+                dim,
+                dim,
+                kernel_size=1
+            ),
+
+            nn.GELU(),
+
+            nn.Conv2d(
+                dim,
+                dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                groups=dim
+            ),
+
+            nn.Conv2d(
+                dim,
+                dim,
+                kernel_size=1
+            )
+        )
+
+        # -----------------------------------------
+        # Channel-wise frequency injection strength
+        # -----------------------------------------
+        self.alpha_raw = nn.Parameter(
+            torch.zeros(1, dim, 1, 1)
+        )
+
+        # -----------------------------------------
+        # Global residual strength
+        # -----------------------------------------
+        self.gamma_raw = nn.Parameter(
+            torch.tensor(0.0)
+        )
+
+    def forward(self, x):
+
+        u = x
+
+        # -----------------------------------------
+        # Structural attention
+        # -----------------------------------------
+        attn = self.conv0(x)
+        attn = self.conv_spatial(attn)
+        attn = self.conv1(attn)
+
+        # -----------------------------------------
+        # High-frequency residual
+        # -----------------------------------------
+        low = F.avg_pool2d(
+            x,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        high = x - low
+
+        # -----------------------------------------
+        # High-frequency feature projection
+        # -----------------------------------------
+        freq_feat = self.freq_proj(high)
+
+        # -----------------------------------------
+        # Learnable scaling
+        # -----------------------------------------
+        alpha = 0.2 * torch.tanh(self.alpha_raw)
+        gamma = 0.5 * torch.sigmoid(self.gamma_raw)
+
+        # -----------------------------------------
+        # Frequency-aware modulation
+        # -----------------------------------------
+        freq_gate = self.freq_gate(high)
+
+        attn = attn * (
+            1.0 +
+            alpha *
+            (2.0 * freq_gate - 1.0)
+        )
+
+        # -----------------------------------------
+        # Final output
+        # -----------------------------------------
+        out = (
+            u * attn +
+            gamma * freq_feat
+        )
+
+        return out
+
+# =========================
+# 3. ADPF
+# FGAR main branch
+# + LKAT structural compensation
+# + adaptive fusion
+# =========================
+class ADPF(nn.Module):
+
+    def __init__(self, dim):
+        super().__init__()
+
+        # =========================================
+        # 1. FGAR main branch
+        # =========================================
+        self.fgar = FGAR(dim)
+
+        # =========================================
+        # 2. LKAT compensation branch
+        # =========================================
+        self.lkat = LKAT(dim)
+
+        # =========================================
+        # 3. Adaptive fusion gate
+        # =========================================
+        hidden = max(dim // 4, 8)
+
+        self.mix_gate = nn.Sequential(
+
+            nn.Conv2d(
+                dim * 2,
+                hidden,
+                kernel_size=1,
+                stride=1,
+                padding=0
+            ),
+
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden,
+                dim,
+                kernel_size=1,
+                stride=1,
+                padding=0
+            ),
+
+            nn.Sigmoid()
+        )
+
+        # =========================================
+        # 4. Global compensation strength
+        # =========================================
+        self.beta_raw = nn.Parameter(
+            torch.tensor(-3.0)
+        )
+
+    def forward(self, x):
+
+        # -----------------------------------------
+        # FGAR main branch
+        # -----------------------------------------
+        fgar_out = self.fgar(x)
+
+        # -----------------------------------------
+        # LKAT structural branch
+        # -----------------------------------------
+        lkat_out = self.lkat(x)
+
+        # -----------------------------------------
+        # Structural residual
+        # -----------------------------------------
+        lkat_res = lkat_out - x
+
+        # -----------------------------------------
+        # Learnable global compensation coefficient
+        # sigmoid(-3) ≈ 0.047
+        # -----------------------------------------
+        beta = torch.sigmoid(
+            self.beta_raw
+        )
+
+        # -----------------------------------------
+        # Adaptive fusion
+        # -----------------------------------------
+        fusion_gate = self.mix_gate(
+            torch.cat(
+                [
+                    fgar_out,
+                    lkat_res
+                ],
+                dim=1
+            )
+        )
+
+        compensation = (
+            beta *
+            fusion_gate *
+            lkat_res
+        )
+
+        # -----------------------------------------
+        # FGAR
+        # +
+        # LKAT structural compensation
+        # -----------------------------------------
+        out = (
+            fgar_out +
+            compensation
+        )
+
+        return out
+
+# =========================
+# 4. LayerNorm
+# =========================
+class LayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+# =========================
+# 5. SGAB
+# =========================
+class SGAB(nn.Module):
+    def __init__(self, n_feats):
+        super().__init__()
+        i_feats = n_feats * 2
+        self.Conv1 = nn.Conv2d(n_feats, i_feats, 1, 1, 0)
+        self.DWConv1 = nn.Conv2d(n_feats, n_feats, 7, 1, 7 // 2, groups=n_feats)
+        self.Conv2 = nn.Conv2d(n_feats, n_feats, 1, 1, 0)
+        self.norm = LayerNorm(n_feats, data_format='channels_first')
+        self.scale = nn.Parameter(torch.zeros((1, n_feats, 1, 1)), requires_grad=True)
+
+    def forward(self, x):
+        shortcut = x
+        x = self.Conv1(self.norm(x))
+        a, x = torch.chunk(x, 2, dim=1)
+        x = x * self.DWConv1(a)
+        x = self.Conv2(x)
+        return x * self.scale + shortcut
+
+# =========================
+# 6. CSCA
+# =========================
+class CSCA(nn.Module):
+    def __init__(self, n_feats):
+        super().__init__()
+        if n_feats % 3 != 0:
+            raise ValueError(f"n_feats must be divisible by 3, but got {n_feats}")
+        i_feats = 2 * n_feats
+        c = n_feats // 3
+        self.norm = LayerNorm(n_feats, data_format='channels_first')
+        self.scale = nn.Parameter(torch.zeros((1, n_feats, 1, 1)), requires_grad=True)
+
+        # =========================================
+        # Grouped large-kernel spatial attention
+        # =========================================
+        self.LKA7 = nn.Sequential(
+            nn.Conv2d(c, c, 7, 1, 7 // 2, groups=c),
+            nn.Conv2d(c, c, 9, 1, padding=(9 // 2) * 4, groups=c, dilation=4),
+            nn.Conv2d(c, c, 1)
+        )
+        self.LKA5 = nn.Sequential(
+            nn.Conv2d(c, c, 5, 1, 5 // 2, groups=c),
+            nn.Conv2d(c, c, 7, 1, padding=(7 // 2) * 3, groups=c, dilation=3),
+            nn.Conv2d(c, c, 1)
+        )
+        self.LKA3 = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c),
+            nn.Conv2d(c, c, 5, 1, padding=(5 // 2) * 2, groups=c, dilation=2),
+            nn.Conv2d(c, c, 1)
+        )
+
+        self.X3 = nn.Conv2d(c, c, 3, 1, 1, groups=c)
+        self.X5 = nn.Conv2d(c, c, 5, 1, 5 // 2, groups=c)
+        self.X7 = nn.Conv2d(c, c, 7, 1, 7 // 2, groups=c)
+
+        self.proj_first = nn.Conv2d(n_feats, i_feats, 1)
+        self.proj_last = nn.Conv2d(n_feats, n_feats, 1)
+
+        # =========================================
+        # GDR: local refinement
+        # =========================================
+        self.local_refine = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, 3, 1, 1, groups=n_feats),
+            nn.GELU(),
+            nn.Conv2d(n_feats, n_feats, 5, 1, 2, groups=n_feats),
+            nn.Conv2d(n_feats, n_feats, 1)
+        )
+
+        # =========================================
+        # Cross-stage shared attention refinement
+        # 初始化为较小权重，避免训练初期破坏原始attention
+        # =========================================
+        self.attn_scale = nn.Parameter(torch.tensor(-2.0))
+        self.attn_refine = nn.Sequential(
+            nn.Conv2d(
+                n_feats,
+                n_feats,
+                3,
+                1,
+                1,
+                groups=n_feats
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                n_feats,
+                n_feats,
+                1
+            )
+        )
+
+    def generate_attention(self, a):
+        a1, a2, a3 = torch.chunk(a, 3, dim=1)
+        attn = torch.cat([
+            self.LKA3(a1) * self.X3(a1),
+            self.LKA5(a2) * self.X5(a2),
+            self.LKA7(a3) * self.X7(a3)
+        ], dim=1)
+        return attn
+
+    def forward(self, x, shared_attn=None):
+        shortcut = x
+        x = self.norm(x)
+        x = self.proj_first(x)
+        a, feat = torch.chunk(x, 2, dim=1)
+
+        # 当前block自己的attention
+        local_attn = self.generate_attention(a)
+
+        if shared_attn is None:
+            # 第一个block生成共享attention
+            shared_attn = local_attn.detach()
+            attn = local_attn
+        else:
+            # 限制共享比例
+            share_weight = torch.sigmoid(self.attn_scale)
+            # 当前attention + 历史attention修正
+            attn = local_attn + \
+                   share_weight * self.attn_refine(shared_attn)
+            # 更新共享attention
+            shared_attn = attn.detach()
+
+        out = feat * attn
+        out = self.proj_last(out)
+        out = out + self.local_refine(out)
+        out = out * self.scale + shortcut
+        return out, shared_attn
+
+# =========================
+# 7. HFRB
+# CSCA + SGAB
+# =========================
+class HFRB(nn.Module):
+    def __init__(self, n_feats):
+        super().__init__()
+        self.LKA = CSCA(n_feats)
+        self.LFE = SGAB(n_feats)
+
+    def forward(self, x, shared_attn=None):
+        x, shared_attn = self.LKA(x, shared_attn)
+        x = self.LFE(x)
+        return x, shared_attn
+
+# =========================
+# 8. ResGroup
+# =========================
+class ResGroup(nn.Module):
+    def __init__(
+        self,
+        n_resblocks,
+        n_feats,
+        res_scale=1.0,
+        share_num=4
+    ):
+        super().__init__()
+
+        self.share_num = share_num
+        self.res_scale = res_scale
+
+        self.body = nn.ModuleList([
+            HFRB(n_feats=n_feats)
+            for _ in range(n_resblocks)
+        ])
+
+        self.body_t = ADPF(dim=n_feats)
+
+    def forward(self, x):
+
+        res = x
+
+        shared_attn = None
+
+        for i, block in enumerate(self.body):
+
+            if i % self.share_num == 0:
+                shared_attn = None
+
+            res, shared_attn = block(
+                res,
+                shared_attn
+            )
+
+        res = self.body_t(res)
+
+        return res * self.res_scale + x
+
+# =========================
+# 9. MeanShift
+# =========================
+class MeanShift(nn.Conv2d):
+    def __init__(
+        self,
+        rgb_range,
+        rgb_mean=(0.4488, 0.4371, 0.4040),
+        rgb_std=(1.0, 1.0, 1.0),
+        sign=-1
+    ):
+        super(MeanShift, self).__init__(3, 3, kernel_size=1)
+        std = torch.Tensor(rgb_std)
+        self.weight.data = torch.eye(3).view(3, 3, 1, 1) / std.view(3, 1, 1, 1)
+        self.bias.data = sign * rgb_range * torch.Tensor(rgb_mean) / std
+        for p in self.parameters():
+            p.requires_grad = False
+
+# =========================
+# 10. SFAN
+# =========================
+@ARCH_REGISTRY.register()
+class SFAN(nn.Module):
+
+    def __init__(
+        self,
+        n_resblocks=24,
+        n_resgroups=1,
+        n_colors=3,
+        n_feats=60,
+        scale=2,
+        res_scale=1.0,
+        share_num=2
+    ):
+        super().__init__()
+
+        self.n_resgroups = n_resgroups
+
+        self.sub_mean = MeanShift(1.0)
+
+        self.head = nn.Conv2d(
+            n_colors,
+            n_feats,
+            3,
+            1,
+            1
+        )
+
+        self.body = nn.ModuleList([
+            ResGroup(
+                n_resblocks=n_resblocks,
+                n_feats=n_feats,
+                res_scale=res_scale,
+                share_num=share_num
+            )
+            for _ in range(n_resgroups)
+        ])
+
+        if self.n_resgroups > 1:
+            self.body_t = nn.Conv2d(
+                n_feats,
+                n_feats,
+                3,
+                1,
+                1
+            )
+
+        self.tail = nn.Sequential(
+            nn.Conv2d(
+                n_feats,
+                n_colors * (scale ** 2),
+                3,
+                1,
+                1
+            ),
+            nn.PixelShuffle(scale)
+        )
+
+        self.add_mean = MeanShift(
+            1.0,
+            sign=1
+        )
+
+    def forward(self, x):
+
+        x = self.sub_mean(x)
+
+        x = self.head(x)
+
+        res = x
+
+        for i in self.body:
+            res = i(res)
+
+        if self.n_resgroups > 1:
+            res = self.body_t(res) + x
+
+        x = self.tail(res)
+
+        x = self.add_mean(x)
+
+        return x
+
+    def visual_feature(self, x):
+        fea = []
+        x = self.sub_mean(x)
+        x = self.head(x)
+        res = x
+
+        for i in self.body:
+            res = i(res)
+            fea.append(res)
+
+        if self.n_resgroups > 1:
+            res = self.body_t(res) + x
+
+        x = self.tail(res)
+        x = self.add_mean(x)
+        return x, fea
+
+    def load_state_dict(self, state_dict, strict=False):
+        own_state = self.state_dict()
+        for name, param in state_dict.items():
+            if name in own_state:
+                if isinstance(param, nn.Parameter):
+                    param = param.data
+                try:
+                    own_state[name].copy_(param)
+                except Exception:
+                    if name.find('tail') >= 0:
+                        print('Replace pre-trained upsampler to new one...')
+                    else:
+                        raise RuntimeError(
+                            'While copying the parameter named {}, '
+                            'whose dimensions in the model are {} and '
+                            'whose dimensions in the checkpoint are {}.'
+                            .format(name, own_state[name].size(), param.size())
+                        )
+            elif strict:
+                if name.find('tail') == -1:
+                    raise KeyError('unexpected key "{}" in state_dict'.format(name))
+
+        if strict:
+            missing = set(own_state.keys()) - set(state_dict.keys())
+            if len(missing) > 0:
+                raise KeyError('missing keys in state_dict: "{}"'.format(missing))
